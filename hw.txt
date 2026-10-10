@@ -1,0 +1,6 @@
+﻿生成开始于 20:00...
+1>------ 已启动生成: 项目: HelloWorld, 配置: Debug x64 ------
+1>  hello_world.c
+1>  HelloWorld.vcxproj -> C:\Users\冬天\source\repos\HelloWorld\x64\Debug\HelloWorld.exe
+========== 生成: 1 成功，0 失败，0 最新，0 已跳过 ==========
+========== 生成 于 20:00 完成，耗时 02.697 秒 ==========
