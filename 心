@@ -1,0 +1,219 @@
+/* ============================================================
+ *  Animated Colour-Shifting Heart  --  Windows console, plain C
+ *
+ *  Environment : Visual Studio 2026
+ *  How to use  : File > New > Project > "Console App" (or "Empty
+ *                Project"), add this file, press F5.
+ *                Do NOT use the "Windows Desktop Application"
+ *                template -- that one expects WinMain and will
+ *                fail with LNK2019.
+ *
+ *  Math        : implicit curve  (x^2 + y^2 - 1)^3 - x^2 * y^3 <= 0
+ *                marks the inside of a heart. Every character cell
+ *                is tested against it, then coloured with an ANSI
+ *                24-bit colour escape sequence. Hue is driven by
+ *                time, so the heart cycles through the spectrum.
+ *
+ *  NOTE: this file is deliberately pure ASCII. Chinese comments in
+ *  a UTF-8-without-BOM file make MSVC (which defaults to code page
+ *  936) mis-decode the bytes and emit C2001 / C4819.
+ * ============================================================ */
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <math.h>
+#include <conio.h>
+
+/* Some older SDK headers do not expose this constant. */
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
+#define CELL_H          2.0  /* one character cell is ~2x taller than wide */
+#define BYTES_PER_CELL  32   /* worst case bytes per cell: ANSI seq + glyph */
+
+/* Heart bounding box: x in [-1.30, 1.30], y in [-1.00, 1.22] */
+#define X_SPAN          2.90 /* viewport width  in math units (with margin) */
+#define Y_SPAN          2.60 /* viewport height in math units (with margin) */
+#define Y_CENTER        0.11 /* bbox centre on y, so the heart looks centred */
+
+/* ---------------------------------------------------------------
+ *  Heart implicit function: <= 0 means (x, y) is inside the heart
+ * --------------------------------------------------------------- */
+static double heart(double x, double y)
+{
+    double a = x * x + y * y - 1.0;
+    return a * a * a - x * x * y * y * y;
+}
+
+/* ---------------------------------------------------------------
+ *  HSV -> RGB.  h is an angle in degrees [0, 360).
+ * --------------------------------------------------------------- */
+static void hsv2rgb(double h, double s, double v, int *r, int *g, int *b)
+{
+    double c   = v * s;
+    double hp  = h / 60.0;
+    double x   = c * (1.0 - fabs(fmod(hp, 2.0) - 1.0));
+    double m   = v - c;
+    double rr = 0.0, gg = 0.0, bb = 0.0;
+
+    switch ((int)hp % 6) {
+    case 0:  rr = c; gg = x;          break;
+    case 1:  rr = x; gg = c;          break;
+    case 2:           gg = c; bb = x; break;
+    case 3:           gg = x; bb = c; break;
+    case 4:  rr = x;          bb = c; break;
+    default: rr = c;          bb = x; break;
+    }
+    *r = (int)((rr + m) * 255.0 + 0.5);
+    *g = (int)((gg + m) * 255.0 + 0.5);
+    *b = (int)((bb + m) * 255.0 + 0.5);
+}
+
+/* ---------------------------------------------------------------
+ *  Bounds-checked formatting append.
+ *  Returns the new write offset; never exceeds cap.
+ * --------------------------------------------------------------- */
+static size_t append(char *buf, size_t cap, size_t n, const char *fmt, ...)
+{
+    va_list ap;
+    int     wrote;
+    size_t  room;
+
+    if (n >= cap)
+        return cap;
+    room = cap - n;
+
+    va_start(ap, fmt);
+    wrote = vsnprintf(buf + n, room, fmt, ap);
+    va_end(ap);
+
+    if (wrote < 0)                 /* encoding error: stop appending */
+        return cap;
+    if ((size_t)wrote >= room)     /* truncated: report the buffer full */
+        return cap;
+    return n + (size_t)wrote;
+}
+
+/* ---------------------------------------------------------------
+ *  Console helpers
+ * --------------------------------------------------------------- */
+static int enable_vt(HANDLE h)
+{
+    DWORD mode;
+    if (!GetConsoleMode(h, &mode))
+        return 0;
+    return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
+
+static void show_cursor(HANDLE h, int visible)
+{
+    CONSOLE_CURSOR_INFO ci;
+    if (GetConsoleCursorInfo(h, &ci)) {
+        ci.bVisible = visible ? TRUE : FALSE;
+        SetConsoleCursorInfo(h, &ci);
+    }
+}
+
+/* ---------------------------------------------------------------
+ *  Render one frame.
+ *
+ *  Character cell -> math coordinate:
+ *      screen centre maps to (0, Y_CENTER)
+ *      one column  == 1/s math units
+ *      one row     == CELL_H/s math units, which is what keeps the
+ *                     heart from being stretched vertically.
+ * --------------------------------------------------------------- */
+static void render(HANDLE out, double t)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    char  *buf;
+    size_t cap, n = 0;
+    int    cols, rows, j, i;
+    double s, pulse, hue0;
+
+    if (!GetConsoleScreenBufferInfo(out, &csbi))
+        return;
+
+    /* Leave out the last column/row so writing never scrolls the screen */
+    cols = csbi.srWindow.Right  - csbi.srWindow.Left + 1 - 1;
+    rows = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1 - 1;
+    if (cols < 20) cols = 20;
+    if (rows < 10) rows = 10;
+
+    cap = (size_t)cols * (size_t)rows * BYTES_PER_CELL + 256;
+    buf = (char *)malloc(cap);
+    if (!buf)
+        return;
+
+    /* Uniform scale: take the tighter of the two axes so the shape holds */
+    {
+        double sx = cols / X_SPAN;
+        double sy = rows * CELL_H / Y_SPAN;
+        s = (sx < sy) ? sx : sy;
+    }
+    pulse = 1.0 + 0.07 * sin(t * 3.0);   /* breathing scale  */
+    hue0  = fmod(t * 45.0, 360.0);       /* hue drift        */
+
+    for (j = 0; j < rows && n < cap; j++) {
+        n = append(buf, cap, n, "\x1b[%d;1H", j + 1);   /* cursor to row start */
+
+        for (i = 0; i < cols && n < cap; i++) {
+            double X   = (i - cols / 2.0 + 0.5) / s;
+            double Y   = (rows / 2.0 - j - 0.5) * CELL_H / s + Y_CENTER;
+            double hue = fmod(hue0 + (double)j / rows * 70.0, 360.0);
+            int    r, g, b;
+
+            if (heart(X / pulse, Y / pulse) <= 0.0) {
+                /* heart body */
+                hsv2rgb(hue, 1.0, 1.0, &r, &g, &b);
+                n = append(buf, cap, n, "\x1b[38;2;%d;%d;%dm@", r, g, b);
+            }
+            else if (heart(X / (pulse * 1.18), Y / (pulse * 1.18)) <= 0.0) {
+                /* outer glow ring */
+                hsv2rgb(hue, 1.0, 0.45, &r, &g, &b);
+                n = append(buf, cap, n, "\x1b[38;2;%d;%d;%dm.", r, g, b);
+            }
+            else if (n < cap) {
+                buf[n++] = ' ';
+            }
+        }
+    }
+
+    n = append(buf, cap, n, "\x1b[0m");   /* reset colour */
+
+    fwrite(buf, 1, n, stdout);
+    fflush(stdout);
+    free(buf);
+}
+
+int main(void)
+{
+    HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+    double t = 0.0;
+
+    if (!enable_vt(out)) {
+        printf("Failed to enable ANSI escape sequences.\n");
+        return 1;
+    }
+
+    show_cursor(out, 0);
+    fputs("\x1b[2J\x1b[H", stdout);        /* clear screen, home cursor */
+
+    while (!_kbhit()) {                     /* any key quits */
+        render(out, t);
+        Sleep(30);                          /* ~33 fps */
+        t += 0.03;
+    }
+
+    _getch();
+    fputs("\x1b[0m\x1b[2J\x1b[H", stdout);  /* reset colour, clear screen */
+    fflush(stdout);
+    show_cursor(out, 1);
+
+    printf("Bye!\n");
+    return 0;
+}
