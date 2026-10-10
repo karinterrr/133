@@ -1,0 +1,723 @@
+/* ============================================================
+ *  Pixel Plane Shooter  --  Windows console game in plain C
+ *
+ *  Environment : Visual Studio 2026
+ *  How to use  : File > New > Project > "Console App" (or "Empty
+ *                Project"), add this file, press F5 / Ctrl+F5.
+ *                Do NOT pick "Windows Desktop Application" --
+ *                that template expects WinMain and fails LNK2019.
+ *
+ *  Controls    : ARROWS or W A S D  -> move
+ *                SPACE or W/UP      -> fire
+ *                R                  -> restart after game over
+ *                ESC                -> quit
+ *
+ *  Rendering   : a char grid and a colour grid are painted each
+ *                frame, then emitted as one ANSI true-colour blob.
+ *                A colour escape is only emitted when the colour
+ *                actually changes, which keeps the output small.
+ *
+ *  Sprites are 7 wide by 3 tall on purpose: a console cell is about
+ *  twice as tall as it is wide, so 7x3 cells is roughly square in
+ *  real pixels. A 5x3 sprite would look tall and skinny.
+ *
+ *  NOTE: this file is deliberately pure ASCII. Chinese comments in a
+ *  UTF-8-without-BOM file make MSVC (which defaults to code page
+ *  936) mis-decode the bytes and emit C2001 / C4819.
+ * ============================================================ */
+#define _CRT_SECURE_NO_WARNINGS
+
+#include <windows.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <string.h>
+#include <math.h>
+
+/* GetAsyncKeyState lives in user32. The pragma saves you from having
+ * to add user32.lib by hand under Project > Properties > Linker. */
+#pragma comment(lib, "user32.lib")
+
+/* ---------------- tuning ---------------- */
+#define FRAME_MS        16      /* ~60 fps target                     */
+#define MAX_BULLETS     64
+#define MAX_ENEMIES     32
+#define MAX_SPARKS      160
+#define MAX_STARS       70
+
+#define SPRITE_W        7       /* both sprites share this width      */
+#define SPRITE_H        3
+#define PLAYER_W        SPRITE_W
+#define PLAYER_H        SPRITE_H
+#define ENEMY_W         SPRITE_W
+#define ENEMY_H         SPRITE_H
+
+#define PLAY_TOP        1       /* row 0 is the HUD                   */
+#define PLAYER_SPEED_X  38.0    /* cells per second                   */
+#define PLAYER_SPEED_Y  26.0
+#define BULLET_SPEED    60.0
+#define FIRE_COOLDOWN   0.13    /* seconds between shots              */
+#define START_LIVES     3
+#define INVULN_TIME     1.20    /* mercy window after a hit           */
+#define MAX_DT          (1.0 / 30.0)
+
+#define STATE_PLAY      0
+#define STATE_OVER      1
+
+/* ---------------- palette ---------------- */
+enum {
+    COL_BG = 0,
+    COL_STAR_DIM,
+    COL_STAR_BRIGHT,
+    COL_PLAYER,
+    COL_BULLET,
+    COL_ENEMY,
+    COL_HUD,
+    COL_FIRE,
+    COL_WHITE,
+    COL_COUNT
+};
+
+/* COL_BG is an empty string: those cells only ever hold spaces, so
+ * skipping the escape saves a lot of bytes every frame. */
+static const char *const COL_SEQ[COL_COUNT] = {
+    "",
+    "\x1b[38;2;80;80;120m",
+    "\x1b[38;2;175;175;215m",
+    "\x1b[38;2;90;235;255m",
+    "\x1b[38;2;255;235;80m",
+    "\x1b[38;2;255;70;90m",
+    "\x1b[38;2;200;205;215m",
+    "\x1b[38;2;255;165;40m",
+    "\x1b[38;2;255;255;255m"
+};
+
+typedef const char (*SpriteArt)[SPRITE_W + 1];
+
+/* ---------------- sprites ---------------- */
+/* Player: nose up. Enemy: the same silhouette flipped, so it reads
+ * as "diving straight at you". Red vs cyan keeps them distinct.
+ * Declared as 2-D arrays so a row of the wrong width is caught by
+ * the compiler (and again at run time by sprites_ok). */
+static const char PLAYER_ART[SPRITE_H][SPRITE_W + 1] = {
+    "   ^   ",
+    "  /o\\  ",
+    "<==|==>"
+};
+static const char ENEMY_ART[SPRITE_H][SPRITE_W + 1] = {
+    "<==|==>",
+    "  \\o/  ",
+    "   v   "
+};
+
+/* ---------------- entities ---------------- */
+typedef struct { double x, y; int active; }               Bullet;
+typedef struct { double x, y, vx; int active; }           Enemy;
+typedef struct { double x, y, vx, vy, life; int active; } Spark;
+typedef struct { double x, y, speed; int bright; }        Star;
+
+static Bullet g_bullets[MAX_BULLETS];
+static Enemy  g_enemies[MAX_ENEMIES];
+static Spark  g_sparks[MAX_SPARKS];
+static Star   g_stars[MAX_STARS];
+
+static double g_player_x, g_player_y;
+static double g_fire_cd, g_invuln, g_spawn_cd, g_time;
+static int    g_lives, g_score, g_state;
+
+/* ---------------- screen buffers ---------------- */
+static int             g_cols, g_rows;
+static char           *g_glyph;
+static unsigned char  *g_col;
+static char           *g_out;
+static size_t          g_outcap;
+static unsigned char   g_prev_key[256];
+
+/* =================================================================
+ *  Small helpers
+ * ================================================================= */
+static double rand01(void)
+{
+    return (double)rand() / ((double)RAND_MAX + 1.0);
+}
+static double rand_range(double lo, double hi)
+{
+    return lo + rand01() * (hi - lo);
+}
+
+static int key_down(int vk)
+{
+    return (GetAsyncKeyState(vk) & 0x8000) != 0;
+}
+
+/* Edge-triggered: true only on the frame the key goes down.
+ * Call it exactly once per frame per watched key, otherwise the
+ * stored previous state drifts out of sync. */
+static int key_pressed(int vk)
+{
+    int idx  = vk & 0xFF;
+    int down = key_down(vk);
+    int was  = g_prev_key[idx];
+    g_prev_key[idx] = (unsigned char)(down ? 1 : 0);
+    return down && !was;
+}
+
+/* ---------------- bounds-checked append ---------------- */
+static size_t app(char *buf, size_t cap, size_t n, const char *fmt, ...)
+{
+    va_list ap;
+    int     wrote;
+    size_t  room;
+
+    if (n >= cap)
+        return cap;
+    room = cap - n;
+
+    va_start(ap, fmt);
+    wrote = vsnprintf(buf + n, room, fmt, ap);
+    va_end(ap);
+
+    if (wrote < 0)                /* encoding error: stop appending */
+        return cap;
+    if ((size_t)wrote >= room)    /* truncated: flag the buffer full */
+        return cap;
+    return n + (size_t)wrote;
+}
+
+/* ---------------- painting ---------------- */
+static void put(int x, int y, int ch, int col)
+{
+    if (x < 0 || x >= g_cols || y < 0 || y >= g_rows)
+        return;
+    g_glyph[(size_t)y * g_cols + x] = (char)ch;
+    g_col[(size_t)y * g_cols + x]   = (unsigned char)col;
+}
+
+/* Spaces in the art are transparent, so sprites overlay cleanly. */
+static void put_sprite(int x, int y, SpriteArt art, int col)
+{
+    int r, c;
+    for (r = 0; r < SPRITE_H; r++)
+        for (c = 0; c < SPRITE_W; c++)
+            if (art[r][c] != ' ')
+                put(x + c, y + r, (unsigned char)art[r][c], col);
+}
+
+static void put_text(int x, int y, const char *s, int col)
+{
+    int i;
+    for (i = 0; s[i] != '\0'; i++)
+        put(x + i, y, (unsigned char)s[i], col);
+}
+
+static void put_text_centered(int y, const char *s, int col)
+{
+    put_text((g_cols - (int)strlen(s)) / 2, y, s, col);
+}
+
+static void clear_scene(void)
+{
+    memset(g_glyph, ' ', (size_t)g_cols * g_rows);
+    memset(g_col, COL_BG, (size_t)g_cols * g_rows);
+}
+
+/* =================================================================
+ *  Console plumbing
+ * ================================================================= */
+static int enable_vt(HANDLE h)
+{
+    DWORD mode;
+    if (!GetConsoleMode(h, &mode))
+        return 0;
+    return SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0;
+}
+
+static void show_cursor(HANDLE h, int visible)
+{
+    CONSOLE_CURSOR_INFO ci;
+    if (GetConsoleCursorInfo(h, &ci)) {
+        ci.bVisible = visible ? TRUE : FALSE;
+        SetConsoleCursorInfo(h, &ci);
+    }
+}
+
+/* Allocate the new buffers before releasing the old ones, so a failed
+ * allocation leaves the previous, working set intact. */
+static int alloc_buffers(int cols, int rows)
+{
+    size_t         cells = (size_t)cols * (size_t)rows;
+    size_t         cap   = cells * 32 + (size_t)rows * 16 + 64;
+    char          *g = (char *)malloc(cells);
+    unsigned char *c = (unsigned char *)malloc(cells);
+    char          *o = (char *)malloc(cap);
+
+    if (g == NULL || c == NULL || o == NULL) {
+        free(g); free(c); free(o);
+        return 0;
+    }
+    free(g_glyph); free(g_col); free(g_out);
+    g_glyph = g; g_col = c; g_out = o;
+    g_outcap = cap; g_cols = cols; g_rows = rows;
+    return 1;
+}
+
+/* Returns 0 when the window is too small to host the game. */
+static int sync_size(HANDLE out)
+{
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    int cols, rows;
+
+    if (!GetConsoleScreenBufferInfo(out, &csbi))
+        return 0;
+
+    /* Drop the last column and row so a full-width write can never
+     * wrap onto the next line and scroll the whole window. */
+    cols = csbi.srWindow.Right  - csbi.srWindow.Left + 1 - 1;
+    rows = csbi.srWindow.Bottom - csbi.srWindow.Top  + 1 - 1;
+    if (cols < 32 || rows < 16)
+        return 0;
+
+    if (cols != g_cols || rows != g_rows)
+        return alloc_buffers(cols, rows);
+    return 1;
+}
+
+static void flush_frame(void)
+{
+    size_t n = 0;
+    int    last = -1, x, y, full = 0;
+
+    for (y = 0; y < g_rows && !full; y++) {
+        n = app(g_out, g_outcap, n, "\x1b[%d;1H", y + 1);
+        for (x = 0; x < g_cols; x++) {
+            int c = g_col[(size_t)y * g_cols + x];
+            if (c != last) {
+                n = app(g_out, g_outcap, n, "%s", COL_SEQ[c]);
+                last = c;
+            }
+            if (n < g_outcap)
+                g_out[n++] = g_glyph[(size_t)y * g_cols + x];
+            else {
+                full = 1;
+                break;
+            }
+        }
+        if (n >= g_outcap)
+            full = 1;
+    }
+    n = app(g_out, g_outcap, n, "\x1b[0m");
+
+    fwrite(g_out, 1, n, stdout);
+    fflush(stdout);
+}
+
+/* =================================================================
+ *  Game state
+ * ================================================================= */
+static void reset_game(void)
+{
+    int i;
+
+    memset(g_bullets, 0, sizeof(g_bullets));
+    memset(g_enemies, 0, sizeof(g_enemies));
+    memset(g_sparks,  0, sizeof(g_sparks));
+
+    for (i = 0; i < MAX_STARS; i++) {
+        g_stars[i].x      = rand_range(0.0, (double)g_cols);
+        g_stars[i].y      = rand_range((double)PLAY_TOP, (double)g_rows);
+        g_stars[i].speed  = rand_range(4.0, 18.0);
+        g_stars[i].bright = (rand() % 4) == 0;
+    }
+
+    g_player_x = (g_cols - PLAYER_W) / 2.0;
+    g_player_y = g_rows - PLAYER_H - 2.0;
+    g_fire_cd  = 0.0;
+    g_invuln   = INVULN_TIME;   /* free moment at the start */
+    g_spawn_cd = 0.7;
+    g_time     = 0.0;
+    g_lives    = START_LIVES;
+    g_score    = 0;
+    g_state    = STATE_PLAY;
+}
+
+static void spawn_bullet(void)
+{
+    int i;
+    for (i = 0; i < MAX_BULLETS; i++) {
+        if (!g_bullets[i].active) {
+            /* Derive the muzzle from the same rounded origin the sprite
+             * is drawn with, so the shot leaves the nose dead centre
+             * instead of one column to the right. */
+            double ox = floor(g_player_x + 0.5);
+            g_bullets[i].active = 1;
+            g_bullets[i].x = ox + PLAYER_W / 2;
+            g_bullets[i].y = g_player_y - 1.0;
+            return;
+        }
+    }
+}
+
+static void spawn_enemy(void)
+{
+    int i;
+    for (i = 0; i < MAX_ENEMIES; i++) {
+        if (!g_enemies[i].active) {
+            g_enemies[i].active = 1;
+            g_enemies[i].x = rand_range(0.0, (double)(g_cols - ENEMY_W));
+            g_enemies[i].y = (double)PLAY_TOP;
+            g_enemies[i].vx = rand_range(-6.0, 6.0);
+            return;
+        }
+    }
+}
+
+static void spawn_explosion(double x, double y)
+{
+    int i, made = 0;
+    for (i = 0; i < MAX_SPARKS && made < 10; i++) {
+        if (!g_sparks[i].active) {
+            g_sparks[i].active = 1;
+            g_sparks[i].x      = x + rand_range(0.0, (double)ENEMY_W);
+            g_sparks[i].y      = y + rand_range(0.0, (double)ENEMY_H);
+            g_sparks[i].vx     = rand_range(-26.0, 26.0);
+            g_sparks[i].vy     = rand_range(-18.0, 26.0);
+            g_sparks[i].life   = rand_range(0.28, 0.50);
+            made++;
+        }
+    }
+}
+
+static void lose_life(void)
+{
+    if (g_invuln > 0.0)
+        return;
+    g_lives--;
+    g_invuln = INVULN_TIME;
+    if (g_lives <= 0) {
+        g_lives = 0;
+        g_state = STATE_OVER;
+    }
+}
+
+/* Axis-aligned overlap test in cell units. */
+static int hit(double ax, double ay, int aw, int ah,
+               double bx, double by, int bw, int bh)
+{
+    return ax < bx + bw && ax + aw > bx &&
+           ay < by + bh && ay + ah > by;
+}
+
+/* =================================================================
+ *  Update
+ * ================================================================= */
+static void update(double dt)
+{
+    int    i, j;
+    double y_hi, spawn_gap, espeed;
+
+    g_time += dt;
+    if (g_fire_cd > 0.0) g_fire_cd -= dt;
+    if (g_invuln  > 0.0) g_invuln  -= dt;
+
+    /* ---- player ---- */
+    {
+        double mx = 0.0, my = 0.0;
+        if (key_down(VK_LEFT)  || key_down('A')) mx -= 1.0;
+        if (key_down(VK_RIGHT) || key_down('D')) mx += 1.0;
+        if (key_down(VK_UP)    || key_down('W')) my -= 1.0;
+        if (key_down(VK_DOWN)  || key_down('S')) my += 1.0;
+
+        g_player_x += mx * PLAYER_SPEED_X * dt;
+        g_player_y += my * PLAYER_SPEED_Y * dt;
+
+        /* Keep the plane in the lower part of the screen: it must not
+         * reach the spawn line, or it could appear on top of an enemy
+         * before the player has any chance to react. */
+        y_hi = floor(g_rows * 0.55 + 0.5);
+        if (y_hi < PLAY_TOP) y_hi = PLAY_TOP;
+
+        if (g_player_x < 0.0) g_player_x = 0.0;
+        if (g_player_x > g_cols - PLAYER_W) g_player_x = g_cols - PLAYER_W;
+        if (g_player_y < y_hi) g_player_y = y_hi;
+        if (g_player_y > g_rows - PLAYER_H - 1)
+            g_player_y = g_rows - PLAYER_H - 1;
+
+        if ((key_down(VK_SPACE) || key_down(VK_UP) || key_down('W')) &&
+            g_fire_cd <= 0.0) {
+            spawn_bullet();
+            g_fire_cd = FIRE_COOLDOWN;
+        }
+    }
+
+    /* ---- bullets ---- */
+    for (i = 0; i < MAX_BULLETS; i++) {
+        if (!g_bullets[i].active)
+            continue;
+        g_bullets[i].y -= BULLET_SPEED * dt;
+        if (g_bullets[i].y < PLAY_TOP)
+            g_bullets[i].active = 0;
+    }
+
+    /* ---- enemies ---- */
+    espeed = 9.0 + g_score * 0.055;
+    if (espeed > 23.0) espeed = 23.0;
+
+    spawn_gap = 1.05 - g_score * 0.010;
+    if (spawn_gap < 0.30) spawn_gap = 0.30;
+
+    g_spawn_cd -= dt;
+    if (g_spawn_cd <= 0.0) {
+        spawn_enemy();
+        g_spawn_cd = spawn_gap * rand_range(0.75, 1.25);
+    }
+
+    for (i = 0; i < MAX_ENEMIES; i++) {
+        Enemy *e = &g_enemies[i];
+        if (!e->active)
+            continue;
+
+        e->y += espeed * dt;
+        e->x += e->vx * dt;
+
+        if (e->x < 0.0) { e->x = 0.0; e->vx = -e->vx; }
+        if (e->x > g_cols - ENEMY_W) { e->x = g_cols - ENEMY_W; e->vx = -e->vx; }
+
+        if (e->y > g_rows) {          /* slipped past the player */
+            e->active = 0;
+            lose_life();
+            continue;
+        }
+
+        if (hit(e->x, e->y, ENEMY_W, ENEMY_H,
+                g_player_x, g_player_y, PLAYER_W, PLAYER_H)) {
+            spawn_explosion(e->x, e->y);
+            e->active = 0;
+            lose_life();
+        }
+    }
+
+    /* ---- bullet vs enemy ---- */
+    for (i = 0; i < MAX_BULLETS; i++) {
+        if (!g_bullets[i].active)
+            continue;
+        for (j = 0; j < MAX_ENEMIES; j++) {
+            if (!g_enemies[j].active)
+                continue;
+            if (hit(g_bullets[i].x, g_bullets[i].y, 1, 1,
+                    g_enemies[j].x, g_enemies[j].y, ENEMY_W, ENEMY_H)) {
+                spawn_explosion(g_enemies[j].x, g_enemies[j].y);
+                g_bullets[i].active = 0;
+                g_enemies[j].active = 0;
+                g_score += 10;
+                break;
+            }
+        }
+    }
+
+    /* ---- sparks ---- */
+    for (i = 0; i < MAX_SPARKS; i++) {
+        Spark *s = &g_sparks[i];
+        if (!s->active)
+            continue;
+        s->life -= dt;
+        if (s->life <= 0.0) {
+            s->active = 0;
+            continue;
+        }
+        s->x += s->vx * dt;
+        s->y += s->vy * dt;
+        s->vy += 26.0 * dt;        /* a little gravity */
+    }
+
+    /* ---- starfield ---- */
+    for (i = 0; i < MAX_STARS; i++) {
+        g_stars[i].y += g_stars[i].speed * dt;
+        if (g_stars[i].y >= g_rows) {
+            g_stars[i].y      = (double)PLAY_TOP;
+            g_stars[i].x      = rand_range(0.0, (double)g_cols);
+            g_stars[i].speed  = rand_range(4.0, 18.0);
+            g_stars[i].bright = (rand() % 4) == 0;
+        }
+    }
+}
+
+/* =================================================================
+ *  Render
+ * ================================================================= */
+static void render(void)
+{
+    int  i, x, y;
+
+    clear_scene();
+
+    /* starfield */
+    for (i = 0; i < MAX_STARS; i++) {
+        put((int)floor(g_stars[i].x + 0.5), (int)floor(g_stars[i].y + 0.5),
+            g_stars[i].bright ? '*' : '.',
+            g_stars[i].bright ? COL_STAR_BRIGHT : COL_STAR_DIM);
+    }
+
+    /* enemies */
+    for (i = 0; i < MAX_ENEMIES; i++) {
+        if (!g_enemies[i].active)
+            continue;
+        put_sprite((int)floor(g_enemies[i].x + 0.5),
+                   (int)floor(g_enemies[i].y + 0.5),
+                   ENEMY_ART, COL_ENEMY);
+    }
+
+    /* bullets */
+    for (i = 0; i < MAX_BULLETS; i++) {
+        if (!g_bullets[i].active)
+            continue;
+        put((int)floor(g_bullets[i].x + 0.5),
+            (int)floor(g_bullets[i].y + 0.5), '|', COL_BULLET);
+    }
+
+    /* sparks */
+    for (i = 0; i < MAX_SPARKS; i++) {
+        Spark *s = &g_sparks[i];
+        int    ch;
+        if (!s->active)
+            continue;
+        ch = (s->life > 0.32) ? '*' : (s->life > 0.16) ? '+' : '.';
+        put((int)floor(s->x + 0.5), (int)floor(s->y + 0.5), ch, COL_FIRE);
+    }
+
+    /* player -- blinks during the mercy window */
+    {
+        int blink = (g_invuln > 0.0) && (((int)(g_invuln * 12.0)) % 2 == 0);
+        if (!blink)
+            put_sprite((int)floor(g_player_x + 0.5),
+                       (int)floor(g_player_y + 0.5),
+                       PLAYER_ART, COL_PLAYER);
+    }
+
+    /* HUD */
+    {
+        char hud[160];
+        char lives[16];
+        int  k, m = 0;
+
+        for (k = 0; k < g_lives && m < (int)sizeof(lives) - 1; k++)
+            lives[m++] = '<';
+        lives[m] = '\0';
+
+        snprintf(hud, sizeof(hud), " SCORE %05d   LIVES %s", g_score, lives);
+        put_text(0, 0, hud, COL_HUD);
+    }
+
+    /* game-over overlay */
+    if (g_state == STATE_OVER) {
+        char line[64];
+
+        y = g_rows / 2 - 2;
+        for (x = 0; x < g_cols; x++) {
+            int r;
+            for (r = 0; r < 5; r++)          /* blank band behind text */
+                put(x, y + r, ' ', COL_BG);
+        }
+        put_text_centered(y + 0, "  G A M E   O V E R  ", COL_ENEMY);
+
+        snprintf(line, sizeof(line), "SCORE %05d", g_score);
+        put_text_centered(y + 2, line, COL_WHITE);
+        put_text_centered(y + 3, "R RESTART   ESC QUIT", COL_HUD);
+    }
+}
+
+/* =================================================================
+ *  Startup self-check: every sprite row must fill the full width.
+ *  A short row would silently become blank cells and the sprite
+ *  would render lopsided, so fail loudly instead.
+ * ================================================================= */
+static int sprites_ok(void)
+{
+    int r;
+    for (r = 0; r < SPRITE_H; r++) {
+        if ((int)strlen(PLAYER_ART[r]) != SPRITE_W) return 0;
+        if ((int)strlen(ENEMY_ART[r])  != SPRITE_W) return 0;
+    }
+    return 1;
+}
+
+/* =================================================================
+ *  Main
+ * ================================================================= */
+int main(void)
+{
+    HANDLE    out = GetStdHandle(STD_OUTPUT_HANDLE);
+    ULONGLONG last;
+    int       inited = 0;
+
+    if (!sprites_ok()) {
+        printf("Sprite art width mismatch: expected %d chars per row.\n",
+               SPRITE_W);
+        return 1;
+    }
+
+    if (!enable_vt(out)) {
+        printf("This console does not support ANSI escape sequences.\n");
+        return 1;
+    }
+
+    SetConsoleTitleA("Pixel Plane Shooter");
+    show_cursor(out, 0);
+    fputs("\x1b[2J\x1b[H", stdout);
+
+    srand((unsigned)GetTickCount64());
+    last = GetTickCount64();
+
+    for (;;) {
+        ULONGLONG now;
+        double    dt;
+        int       esc, restart;
+
+        if (!sync_size(out)) {
+            fputs("\x1b[2J\x1b[H\x1b[38;2;255;90;90m"
+                  "Please enlarge the window to at least 32x16 cells."
+                  "\x1b[0m", stdout);
+            fflush(stdout);
+            Sleep(200);
+            last = GetTickCount64();
+            continue;
+        }
+
+        /* reset_game needs g_cols/g_rows, so it can only run once the
+         * first successful sync_size has told us how big we are. */
+        if (!inited) {
+            reset_game();
+            inited = 1;
+        }
+
+        now  = GetTickCount64();
+        dt   = (double)(now - last) / 1000.0;
+        last = now;
+        if (dt > MAX_DT) dt = MAX_DT;   /* clamp after a stall: this also
+                                         * keeps bullets from tunnelling
+                                         * through an enemy in one step */
+
+        esc     = key_pressed(VK_ESCAPE);
+        restart = key_pressed('R');
+
+        if (esc)
+            break;
+        if (g_state == STATE_OVER && restart)
+            reset_game();
+
+        if (g_state == STATE_PLAY)
+            update(dt);
+
+        render();
+        flush_frame();
+        Sleep(FRAME_MS);
+    }
+
+    fputs("\x1b[0m\x1b[2J\x1b[H", stdout);   /* reset colour, clear screen */
+    fflush(stdout);
+    show_cursor(out, 1);
+
+    printf("Thanks for playing!  Final score: %d\n", g_score);
+
+    free(g_glyph); free(g_col); free(g_out);
+    return 0;
+}
