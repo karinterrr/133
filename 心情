@@ -1,0 +1,854 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>✨ 此刻心情 · Mood</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  html, body { height: 100%; overflow: hidden; }
+
+  body {
+    /* ---- 深色主题(默认)的配色变量 ---- */
+    --ink: #fff;
+    --glass-bg: rgba(255,255,255,.10);
+    --glass-hover: rgba(255,255,255,.20);
+    --glass-active: rgba(255,255,255,.30);
+    --glass-border: rgba(255,255,255,.25);
+    --glass-glow: rgba(255,255,255,.35);
+    --vig: rgba(0,0,0,.38);
+    --txt-shadow: 0 4px 18px rgba(0,0,0,.3);
+    --name-shadow: 0 4px 22px rgba(0,0,0,.35);
+    --face-shadow: 0 18px 34px rgba(0,0,0,.35);
+
+    font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+    color: var(--ink);
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+    transition: color .5s ease;
+  }
+
+  /* ---- 浅色主题:覆盖配色变量,深色墨水字 + 柔和玻璃 ---- */
+  body.theme-light {
+    --ink: #33334d;
+    --glass-bg: rgba(255,255,255,.5);
+    --glass-hover: rgba(255,255,255,.75);
+    --glass-active: rgba(255,255,255,.9);
+    --glass-border: rgba(60,60,100,.18);
+    --glass-glow: rgba(120,110,180,.3);
+    --vig: rgba(100,90,130,.18);
+    --txt-shadow: 0 4px 18px rgba(110,100,150,.28);
+    --name-shadow: 0 4px 22px rgba(110,100,150,.3);
+    --face-shadow: 0 18px 34px rgba(110,100,150,.28);
+  }
+
+  /* ---------- 双层背景，切换心情时平滑交叉淡入淡出 ---------- */
+  .bg {
+    position: fixed; inset: 0; z-index: -2;
+    transition: opacity 1s ease;
+  }
+  #bgA { background: linear-gradient(160deg, #ffd86f, #fc6262 55%, #f8498b); }
+  #bgB { opacity: 0; }
+
+  .vignette {
+    position: fixed; inset: 0; z-index: -1;
+    background: radial-gradient(ellipse at center, transparent 40%, var(--vig) 100%);
+    pointer-events: none;
+  }
+
+  canvas#fx { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+
+  /* ---------- 顶部实时时钟 ---------- */
+  .clock {
+    position: fixed; top: 18px; left: 50%;
+    transform: translateX(-50%);
+    z-index: 2;
+    display: flex; flex-direction: column; align-items: center; gap: 5px;
+    padding: 12px 30px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 18px;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.18);
+    animation: fadeUp .8s ease both;
+  }
+  .clock-time {
+    display: flex; align-items: baseline;
+    font-size: clamp(26px, 5vw, 38px);
+    font-weight: 700;
+    letter-spacing: .06em;
+    font-variant-numeric: tabular-nums; /* 等宽数字,避免跳动 */
+    line-height: 1;
+    text-shadow: var(--txt-shadow);
+  }
+  .clock-time .sec { font-size: .55em; opacity: .9; }
+  .clock-time .sec.tick { animation: tickIn .45s ease; }
+  @keyframes tickIn {
+    from { opacity: .2; transform: translateY(-2px); }
+    to   { opacity: .9; transform: none; }
+  }
+  .clock-date {
+    font-size: 13px;
+    opacity: .8;
+    letter-spacing: .12em;
+    font-variant-numeric: tabular-nums;
+  }
+  .clock-weekend {
+    font-size: 13px;
+    letter-spacing: .08em;
+    opacity: .95;
+    padding-top: 6px;
+    margin-top: 3px;
+    border-top: 1px solid var(--glass-border); /* 分隔线随主题变色 */
+  }
+
+  /* ---------- 场景布局 ---------- */
+  .scene {
+    position: relative; z-index: 1;
+    height: 100%;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 14px;
+    text-align: center;
+    padding: 140px 24px 185px; /* 顶部避开时钟,底部避开心情记录 */
+  }
+
+  .eyebrow {
+    font-size: 13px; letter-spacing: .35em; text-indent: .35em;
+    opacity: .85;
+  }
+
+  .face-wrap { position: relative; display: inline-block; margin: 10px 0 6px; }
+
+  .glow {
+    position: absolute; left: 50%; top: 50%;
+    width: 240px; height: 240px;
+    transform: translate(-50%, -50%);
+    border-radius: 50%;
+    background: radial-gradient(circle, var(--glow, rgba(255,220,130,.55)) 0%, transparent 70%);
+    filter: blur(8px);
+    animation: pulse 4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { transform: translate(-50%,-50%) scale(1);   opacity: .75; }
+    50%      { transform: translate(-50%,-50%) scale(1.18); opacity: 1;   }
+  }
+
+  .face {
+    position: relative;
+    font-size: clamp(96px, 22vw, 172px);
+    line-height: 1.15;
+    filter: drop-shadow(var(--face-shadow));
+  }
+
+  /* ---------- 各种心情的大表情动画 ---------- */
+  .mood-happy   .face { animation: bounce 1.1s ease-in-out infinite; }
+  .mood-calm    .face { animation: breathe 5.2s ease-in-out infinite; }
+  .mood-sad     .face { animation: droop 4s ease-in-out infinite; }
+  .mood-angry   .face { animation: rage .32s linear infinite; }
+  .mood-excited .face { animation: party .75s ease-in-out infinite; }
+
+  @keyframes bounce {
+    0%, 100% { transform: translateY(0) scale(1); }
+    35%      { transform: translateY(-30px) scale(1.05, .95); }
+    55%      { transform: translateY(0) scale(.95, 1.06); }
+    75%      { transform: translateY(-8px) scale(1); }
+  }
+  @keyframes breathe {
+    0%, 100% { transform: scale(1); }
+    50%      { transform: scale(1.09); }
+  }
+  @keyframes droop {
+    0%, 100% { transform: translateY(8px) rotate(-3deg); }
+    50%      { transform: translateY(13px) rotate(3deg); }
+  }
+  @keyframes rage {
+    0%, 100% { transform: rotate(-4deg) scale(1.02); }
+    25%      { transform: rotate(3deg) translateY(-4px); }
+    50%      { transform: rotate(-2deg) scale(1.04); }
+    75%      { transform: rotate(4deg) translateY(-2px); }
+  }
+  @keyframes party {
+    0%, 100% { transform: translateY(0) rotate(-7deg); }
+    25%      { transform: translateY(-24px) rotate(0) scale(1.07); }
+    50%      { transform: translateY(0) rotate(7deg); }
+    75%      { transform: translateY(-12px) rotate(0) scale(1.03); }
+  }
+
+  /* 愤怒时整个舞台跟着颤抖 */
+  .mood-angry .stage { animation: quake .35s linear infinite; }
+  @keyframes quake {
+    0%, 100% { transform: translate(0, 0); }
+    25%  { transform: translate(-4px, 2px); }
+    50%  { transform: translate(3px, -3px); }
+    75%  { transform: translate(-2px, -2px); }
+  }
+  .stage { display: flex; flex-direction: column; align-items: center; gap: 14px; }
+
+  /* 悲伤时的眼泪(仅 sad 模式显示) */
+  .tears { position: absolute; inset: 0; opacity: 0; transition: opacity .6s; pointer-events: none; }
+  .mood-sad .tears { opacity: 1; }
+  .tear {
+    position: absolute; top: 58%;
+    width: 11px; height: 15px;
+    background: #8ec5ff;
+    border-radius: 55% 55% 60% 60% / 45% 45% 70% 70%;
+    box-shadow: 0 0 8px rgba(140,190,255,.9);
+    animation: teardrop 1.9s ease-in infinite;
+  }
+  .tear.t1 { left: 33%; }
+  .tear.t2 { left: 62%; animation-delay: .95s; }
+  @keyframes teardrop {
+    0%   { transform: translateY(0) scale(.5); opacity: 0; }
+    15%  { opacity: 1; }
+    100% { transform: translateY(96px) scale(1.05); opacity: 0; }
+  }
+
+  /* ---------- 文案 ---------- */
+  .mood-name {
+    font-size: clamp(30px, 6vw, 46px);
+    font-weight: 700;
+    letter-spacing: .12em; text-indent: .12em;
+    text-shadow: var(--name-shadow);
+  }
+
+  .desc {
+    max-width: 34em;
+    font-size: clamp(15px, 2.4vw, 19px);
+    line-height: 1.8;
+    opacity: .92;
+    animation: fadeUp .8s ease both;
+  }
+  .desc.editing {
+    outline: 2px dashed var(--glass-border);
+    outline-offset: 8px;
+    border-radius: 6px;
+    cursor: text;
+    user-select: text;
+  }
+  .note-edit {
+    background: none; border: none; cursor: pointer;
+    color: var(--ink); opacity: .55;
+    font-size: 12px; letter-spacing: .1em;
+    padding: 2px 10px;
+    transition: opacity .25s, color .5s;
+    animation: fadeUp .8s ease both;
+  }
+  .note-edit:hover { opacity: .95; }
+
+  @keyframes fadeUp {
+    from { opacity: 0; transform: translateY(14px); }
+    to   { opacity: .92; transform: translateY(0); }
+  }
+
+  /* ---------- 心情选择按钮 ---------- */
+  .moods {
+    display: flex; gap: 12px; flex-wrap: wrap; justify-content: center;
+    margin-top: 14px;
+  }
+  .mood-btn {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 20px;
+    font-size: 15px; color: var(--ink);
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: transform .25s, background .25s, box-shadow .25s, color .5s, border-color .5s;
+  }
+  .mood-btn:hover { transform: translateY(-3px) scale(1.05); background: var(--glass-hover); }
+  .mood-btn.active {
+    background: var(--glass-active);
+    box-shadow: 0 0 22px var(--glass-glow), inset 0 0 10px rgba(255,255,255,.15);
+  }
+  .mood-btn .em { font-size: 20px; }
+
+  .hint { margin-top: 18px; font-size: 13px; opacity: .7; letter-spacing: .08em; }
+  .date { margin-top: 4px; font-size: 12px; opacity: .55; letter-spacing: .1em; }
+
+  /* ---------- 右上角按钮组(主题切换 + 重置) ---------- */
+  .corner {
+    position: fixed; top: 18px; right: 18px; z-index: 3;
+    display: flex; gap: 10px;
+    animation: fadeUp .8s ease both;
+  }
+  .corner-btn {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 18px;
+    font-size: 14px; color: var(--ink);
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 999px;
+    cursor: pointer;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.12);
+    transition: transform .25s, background .25s, color .5s, border-color .5s;
+  }
+  .corner-btn:hover { transform: translateY(-2px) scale(1.04); background: var(--glass-hover); }
+  .corner-btn .em { font-size: 18px; }
+  .reset-btn:hover { background: rgba(255,90,90,.35); } /* 重置按钮悬停带一点警示色 */
+
+  /* ---------- 重置确认弹窗 ---------- */
+  .modal-mask {
+    position: fixed; inset: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.45);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    opacity: 0; visibility: hidden;
+    transition: opacity .25s ease, visibility .25s ease;
+  }
+  .modal-mask.show { opacity: 1; visibility: visible; }
+  .modal {
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+    max-width: min(86vw, 360px);
+    padding: 30px 34px 26px;
+    text-align: center;
+    color: #fff;
+    background: rgba(28,28,48,.94);
+    border: 1px solid rgba(255,255,255,.2);
+    border-radius: 20px;
+    box-shadow: 0 20px 60px rgba(0,0,0,.4);
+  }
+  body.theme-light .modal {
+    color: var(--ink);
+    background: rgba(255,255,255,.96);
+    border-color: rgba(60,60,100,.15);
+  }
+  .modal-mask.show .modal { animation: pop .28s cubic-bezier(.34,1.56,.64,1) both; }
+  @keyframes pop {
+    from { transform: scale(.85); opacity: 0; }
+    to   { transform: scale(1);  opacity: 1; }
+  }
+  .modal-emoji { font-size: 44px; line-height: 1; }
+  .modal-title { font-size: 20px; letter-spacing: .05em; }
+  .modal-text  { font-size: 14px; line-height: 1.8; opacity: .8; }
+  .modal-btns { display: flex; gap: 12px; margin-top: 10px; }
+  .modal-btns button {
+    padding: 10px 22px;
+    font-size: 14px; font-family: inherit;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: transform .2s, filter .2s;
+  }
+  .modal-btns button:hover { transform: translateY(-2px); }
+  .modal-cancel {
+    color: inherit;
+    background: transparent;
+    border: 1px solid rgba(150,150,170,.5);
+  }
+  .modal-ok {
+    color: #fff;
+    background: linear-gradient(135deg, #ff6b6b, #e84a5f);
+    border: none;
+    box-shadow: 0 6px 18px rgba(232,74,95,.4);
+  }
+  @media (max-width: 600px) {
+    .corner-btn .lbl { display: none; } /* 窄屏只留图标,避免和顶部时钟拥挤 */
+  }
+
+  /* ---------- 底部心情切换记录(最近 5 条) ---------- */
+  .mood-log {
+    position: fixed; bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    z-index: 2;
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    min-width: 260px; max-width: min(92vw, 420px);
+    padding: 12px 24px 14px;
+    background: var(--glass-bg);
+    border: 1px solid var(--glass-border);
+    border-radius: 16px;
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    box-shadow: 0 8px 24px rgba(0,0,0,.15);
+    pointer-events: none;             /* 纯展示,不挡点击彩蛋 */
+    animation: fadeUp .8s ease both;
+  }
+  .log-title {
+    font-size: 12px; letter-spacing: .18em; text-indent: .18em;
+    opacity: .75;
+  }
+  .log-list { display: flex; flex-direction: column; gap: 4px; }
+  .log-entry {
+    font-size: 13px; line-height: 1.6;
+    opacity: .85; white-space: nowrap;
+  }
+  .log-entry .log-time {
+    font-variant-numeric: tabular-nums;
+    opacity: .8; margin-right: 4px;
+  }
+  .log-entry.new { animation: logIn .5s ease both; }
+  @keyframes logIn {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: .85; transform: none; }
+  }
+  .log-empty { opacity: .55; font-size: 12px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .face, .glow, .stage, .tear { animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<div class="bg" id="bgA"></div>
+<div class="bg" id="bgB"></div>
+<div class="vignette"></div>
+<canvas id="fx"></canvas>
+
+<!-- 顶部实时时钟 -->
+<header class="clock">
+  <div class="clock-time"><span id="hmsMain">00:00</span><span class="sec" id="hmsSec">:00</span></div>
+  <div class="clock-date" id="clockDate"></div>
+  <div class="clock-weekend" id="weekendCountdown">⏳ 距离周末还有 X 天</div>
+</header>
+
+<!-- 右上角按钮组:重置 + 深色/浅色切换 -->
+<div class="corner">
+  <button class="corner-btn reset-btn" id="resetBtn"><span class="em">🔄</span><span class="lbl">重置</span></button>
+  <button class="corner-btn" id="themeToggle"><span class="em">☀️</span><span class="lbl">浅色</span></button>
+</div>
+
+<div class="scene mood-happy" id="scene">
+  <div class="stage">
+    <p class="eyebrow">✨ 此 刻 心 情 ✨</p>
+
+    <div class="face-wrap">
+      <div class="glow"></div>
+      <div class="face" id="face">😊</div>
+      <div class="tears"><span class="tear t1"></span><span class="tear t2"></span></div>
+    </div>
+
+    <h1 class="mood-name" id="moodName">开心</h1>
+    <p class="desc" id="desc"></p>
+    <button class="note-edit" id="noteEdit">✏️ 编辑寄语</button>
+
+    <div class="moods" id="moods"></div>
+
+    <p class="hint">点击页面任意空白处，会有小惊喜 ✨</p>
+    <p class="date" id="date"></p>
+  </div>
+</div>
+
+<!-- 底部心情切换记录 -->
+<footer class="mood-log">
+  <div class="log-title">🗂 最近心情记录</div>
+  <div class="log-list" id="logList"></div>
+</footer>
+
+<!-- 重置确认弹窗 -->
+<div class="modal-mask" id="modalMask">
+  <div class="modal">
+    <div class="modal-emoji">🔄</div>
+    <h2 class="modal-title">确定要重置吗?</h2>
+    <p class="modal-text">将清空所有自定义寄语和历史记录,心情恢复为默认的「😊 开心」。<br>此操作无法撤销。</p>
+    <div class="modal-btns">
+      <button class="modal-cancel" id="modalCancel">取消</button>
+      <button class="modal-ok" id="modalOk">确认重置</button>
+    </div>
+  </div>
+</div>
+
+<script>
+/* ===================== 心情配置 ===================== */
+const MOODS = {
+  happy: {
+    emoji: '😊', label: '开心',
+    desc: '阳光正好，嘴角不自觉上扬 —— 今天的世界闪闪发亮！☀️',
+    bg: 'linear-gradient(160deg, #ffd86f, #fc6262 55%, #f8498b)',
+    bgLight: 'linear-gradient(160deg, #fff3c4, #ffd9a8 55%, #ffc4cf)',
+    glow: 'rgba(255,222,130,.55)',
+    chars: ['✨','🌟','💛','🎈','☀️','🎐'],
+    mode: 'rise', rate: 0.35, cap: 60
+  },
+  calm: {
+    emoji: '🌊', label: '平静',
+    desc: '深呼吸，让时间慢下来。此刻内心，像湖面一样安宁。',
+    bg: 'linear-gradient(160deg, #0f2027, #203a43 55%, #2c5364)',
+    bgLight: 'linear-gradient(160deg, #e3f4f1, #c2e4ea 55%, #cfe0f7)',
+    glow: 'rgba(120,220,200,.42)',
+    chars: ['🍃','🌿','💧','🌙','☁️'],
+    mode: 'drift', rate: 0.18, cap: 40
+  },
+  sad: {
+    emoji: '🌧️', label: '悲伤',
+    desc: '有点低落，像窗外下着小雨。不过没关系，雨总会停的。',
+    bg: 'linear-gradient(160deg, #4b6cb7, #3a4a7a 55%, #182848)',
+    bgLight: 'linear-gradient(160deg, #e8edf7, #ccd7ea 55%, #b8c4de)',
+    glow: 'rgba(150,180,230,.4)',
+    chars: ['💧','🌧️','☔','💭'],
+    mode: 'fall', rate: 0.55, cap: 80
+  },
+  angry: {
+    emoji: '😡', label: '愤怒',
+    desc: '怒气值拉满！世界都在颤抖 —— 先深呼吸三秒钟 🔥',
+    bg: 'linear-gradient(160deg, #2b0a0a, #c0182c 60%, #ff5e00)',
+    bgLight: 'linear-gradient(160deg, #ffe8dc, #ffc9bd 60%, #ffb8cd)',
+    glow: 'rgba(255,90,60,.5)',
+    chars: ['💥','🔥','⚡','💢'],
+    mode: 'burst', rate: 0, cap: 110
+  },
+  excited: {
+    emoji: '🎉', label: '兴奋',
+    desc: '心跳加速，满脑子烟花，整个人电量 200% 充满！！',
+    bg: 'linear-gradient(160deg, #2b0b3f, #ff2fb9 60%, #7a00ff)',
+    bgLight: 'linear-gradient(160deg, #f8e7ff, #ffd9f4 60%, #e6dbff)',
+    glow: 'rgba(255,90,220,.5)',
+    chars: ['🎉','⭐','🎊','💫','💜','🎇'],
+    mode: 'confetti', rate: 0, cap: 110
+  }
+};
+
+/* ===================== 画布初始化 ===================== */
+const canvas = document.getElementById('fx');
+const ctx = canvas.getContext('2d');
+let W, H;
+
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ===================== 粒子引擎 ===================== */
+let particles = [];
+let frame = 0;
+let current = 'happy';
+
+function rand(a, b) { return a + Math.random() * (b - a); }
+function pick(arr) { return arr[(Math.random() * arr.length) | 0]; }
+
+function addParticle(p) {
+  if (particles.length >= MOODS[current].cap) return;
+  p.maxLife = p.life;
+  p.rot = p.rot || 0;
+  p.alpha = p.alpha ?? 1;
+  particles.push(p);
+}
+
+/* 环境粒子：随心情不同，从不同方向缓缓出现 */
+function spawnAmbient() {
+  const m = MOODS[current];
+  if (Math.random() > m.rate) return;
+
+  if (m.mode === 'rise') {
+    addParticle({ char: pick(m.chars), x: rand(0, W), y: H + 24,
+      vx: rand(-.3, .3), vy: rand(-1.6, -.7), sway: rand(.4, 1.2), phase: rand(0, 99),
+      vr: rand(-.01, .01), size: rand(16, 32), life: 700, grav: false });
+  } else if (m.mode === 'fall') {
+    addParticle({ char: pick(m.chars), x: rand(0, W), y: -24,
+      vx: rand(-.2, .2), vy: rand(2.2, 4.2), sway: rand(.2, .8), phase: rand(0, 99),
+      vr: 0, size: rand(14, 26), life: 700, grav: false });
+  } else if (m.mode === 'drift') {
+    const fromLeft = Math.random() < .5;
+    addParticle({ char: pick(m.chars),
+      x: fromLeft ? -24 : W + 24, y: rand(H * .1, H * .9),
+      vx: fromLeft ? rand(.3, .8) : rand(-.8, -.3), vy: 0,
+      sway: rand(.15, .45), phase: rand(0, 99),
+      vr: rand(-.008, .008), size: rand(16, 30), life: 1600, grav: false });
+  }
+}
+
+/* 爆发粒子：心情切换 / 点击 / 愤怒兴奋的自动爆发 */
+function burst(x, y, n, power) {
+  const m = MOODS[current];
+  for (let i = 0; i < n; i++) {
+    const ang = rand(0, Math.PI * 2);
+    const sp = rand(1.2, power);
+    addParticle({ char: pick(m.chars), x, y,
+      vx: Math.cos(ang) * sp, vy: Math.sin(ang) * sp - rand(.5, 1.5),
+      vr: rand(-.15, .15), size: rand(14, 30), life: rand(40, 80), grav: true });
+  }
+}
+
+function tick() {
+  frame++;
+  ctx.clearRect(0, 0, W, H);
+
+  const m = MOODS[current];
+  spawnAmbient();
+  if (m.mode === 'burst'    && frame % 22 === 0) burst(rand(W * .1, W * .9), rand(H * .1, H * .6), 8, 4.5);
+  if (m.mode === 'confetti' && frame % 30 === 0) burst(rand(W * .1, W * .9), rand(H * .1, H * .5), 10, 5);
+
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.x += p.vx; p.y += p.vy;
+    if (p.grav) p.vy += 0.09;
+    if (p.sway) p.x += Math.sin((p.maxLife - p.life + p.phase) / 18) * p.sway;
+    p.rot += p.vr;
+    p.life--;
+
+    // 淡入 + 淡出
+    p.alpha = Math.min(1, (p.maxLife - p.life) / 18, p.life / 36);
+
+    const off = p.x < -60 || p.x > W + 60 || p.y < -60 || p.y > H + 60;
+    if (p.life <= 0 || off) { particles.splice(i, 1); continue; }
+
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.font = p.size + 'px "Segoe UI Emoji", "Microsoft YaHei", sans-serif';
+    ctx.globalAlpha = Math.max(0, p.alpha);
+    ctx.fillText(p.char, 0, 0);
+    ctx.restore();
+  }
+  requestAnimationFrame(tick);
+}
+
+/* ===================== 背景交叉淡入淡出 ===================== */
+const bgA = document.getElementById('bgA');
+const bgB = document.getElementById('bgB');
+let frontBg = bgA;
+
+function setBackground(gradient) {
+  const back = frontBg === bgA ? bgB : bgA;
+  back.style.background = gradient;
+  back.style.opacity = 1;
+  frontBg.style.opacity = 0;
+  frontBg = back;
+}
+
+/* ===================== 心情切换 ===================== */
+const scene  = document.getElementById('scene');
+const face   = document.getElementById('face');
+const nameEl = document.getElementById('moodName');
+const descEl = document.getElementById('desc');
+const moodsEl = document.getElementById('moods');
+
+// 生成心情按钮
+for (const [key, m] of Object.entries(MOODS)) {
+  const btn = document.createElement('button');
+  btn.className = 'mood-btn';
+  btn.dataset.mood = key;
+  btn.innerHTML = `<span class="em">${m.emoji}</span>${m.label}`;
+  btn.addEventListener('click', () => setMood(key));
+  moodsEl.appendChild(btn);
+}
+
+function retrigger(el) {       // 重新播放进入动画
+  el.style.animation = 'none';
+  void el.offsetHeight;        // 强制重排
+  el.style.animation = '';
+}
+
+function setMood(key, restore) {
+  const m = MOODS[key];
+  // 真正发生切换才记录(restore=打开页面恢复状态、重复点同一心情,都不算)
+  if (!restore && key !== current) addMoodLog(key);
+  current = key;
+  saveStore('current', key); // 持久化:记住当前心情
+
+  setBackground(currentGradient());
+  scene.className = 'scene mood-' + key;
+  scene.style.setProperty('--glow', m.glow);
+  face.textContent = m.emoji;
+  nameEl.textContent = m.label;
+  descEl.textContent = notes[key] || m.desc; // 优先显示该心情的自定义寄语
+  retrigger(descEl);
+  retrigger(nameEl);
+
+  document.querySelectorAll('.mood-btn').forEach(b =>
+    b.classList.toggle('active', b.dataset.mood === key));
+
+  particles = [];              // 清场后放一次中心烟花
+  burst(W / 2, H * 0.42, 18, 6);
+}
+
+/* 点击空白处：小惊喜爆发 */
+document.addEventListener('pointerdown', e => {
+  if (e.target.closest('.mood-btn, .note-edit, .desc')) return;
+  burst(e.clientX, e.clientY, 14, 5);
+});
+
+/* 底部日期 */
+const d = new Date();
+document.getElementById('date').textContent =
+  `${d.getFullYear()} 年 ${d.getMonth() + 1} 月 ${d.getDate()} 日 · 星期${'日一二三四五六'[d.getDay()]}`;
+
+/* ===================== 顶部实时时钟(每秒更新) ===================== */
+const hmsMain    = document.getElementById('hmsMain');
+const hmsSec     = document.getElementById('hmsSec');
+const clockDateEl = document.getElementById('clockDate');
+const weekendEl  = document.getElementById('weekendCountdown');
+
+function pad(n) { return String(n).padStart(2, '0'); }
+
+function updateClock() {
+  const now = new Date();
+  hmsMain.textContent = pad(now.getHours()) + ':' + pad(now.getMinutes());
+  hmsSec.textContent  = ':' + pad(now.getSeconds());
+  clockDateEl.textContent =
+    now.getFullYear() + ' 年 ' + (now.getMonth() + 1) + ' 月 ' + now.getDate() +
+    ' 日 · 星期' + '日一二三四五六'[now.getDay()];
+
+  // 距离周末倒计时(周六算周末开始):周一~周五 = 6-星期数,周末当天显示特别提示
+  const wd = now.getDay(); // 0=周日, 1=周一 ... 6=周六
+  if (wd === 0 || wd === 6) {
+    weekendEl.textContent = '🎉 今天就是周末,尽情享受吧!';
+  } else {
+    weekendEl.textContent = '⏳ 距离周末还有 ' + (6 - wd) + ' 天';
+  }
+  // 秒数每秒弹入一次,强化"在走"的感觉
+  hmsSec.classList.remove('tick');
+  void hmsSec.offsetWidth;
+  hmsSec.classList.add('tick');
+}
+updateClock();
+setInterval(updateClock, 1000);
+
+/* ===================== 深色 / 浅色主题切换 ===================== */
+let theme = 'dark'; // 'dark' | 'light'
+const themeBtn = document.getElementById('themeToggle');
+
+function currentGradient() {
+  return theme === 'dark' ? MOODS[current].bg : MOODS[current].bgLight;
+}
+
+function toggleTheme() {
+  theme = theme === 'dark' ? 'light' : 'dark';
+  document.body.classList.toggle('theme-light', theme === 'light');
+  // 按钮显示"即将切换到"的主题
+  themeBtn.innerHTML = theme === 'dark'
+    ? '<span class="em">☀️</span><span class="lbl">浅色</span>'
+    : '<span class="em">🌙</span><span class="lbl">深色</span>';
+  setBackground(currentGradient()); // 心情/寄语/动画不变,只换配色
+  saveStore('theme', theme);        // 持久化:记住主题
+}
+themeBtn.addEventListener('click', toggleTheme);
+
+/* ===================== 本地存储(localStorage,刷新/重开浏览器不丢) ===================== */
+function saveStore(k, v) {
+  try { localStorage.setItem('mood.' + k, JSON.stringify(v)); } catch (e) {}
+}
+function loadStore(k, fallback) {
+  try {
+    const s = localStorage.getItem('mood.' + k);
+    return s === null ? fallback : JSON.parse(s);
+  } catch (e) { return fallback; }
+}
+
+/* ===================== 心情切换记录(最近 5 条,最新在上,持久化) ===================== */
+const moodLog = loadStore('log', []); // [{t:'14:32', k:'happy'}, ...] 打开页面直接恢复
+const logListEl = document.getElementById('logList');
+
+function addMoodLog(key) {
+  const now = new Date();
+  moodLog.unshift({ t: pad(now.getHours()) + ':' + pad(now.getMinutes()), k: key });
+  if (moodLog.length > 5) moodLog.pop(); // 超过 5 条,最旧的被挤掉
+  saveStore('log', moodLog);             // 持久化:记住历史记录
+  renderLog();
+}
+
+function renderLog() {
+  if (!moodLog.length) {
+    logListEl.innerHTML = '<div class="log-entry log-empty">暂无记录 · 切换一次心情试试 ✨</div>';
+    return;
+  }
+  logListEl.innerHTML = moodLog.map((e, i) => {
+    const m = MOODS[e.k];
+    if (!m) return ''; // 防御:万一存的数据里有未知心情
+    return '<div class="log-entry' + (i === 0 ? ' new' : '') + '">' +
+      '<span class="log-time">' + e.t + '</span>切换到了 ' + m.emoji + ' ' + m.label +
+      '</div>';
+  }).join('');
+}
+renderLog(); // 渲染恢复出来的记录(首次访问为空态)
+
+/* ===================== 自定义寄语(可编辑,按心情分别保存) ===================== */
+let notes = loadStore('notes', {}); // { happy: '我的寄语', sad: '...' }
+const noteBtn = document.getElementById('noteEdit');
+let editing = false;
+
+function startEditNote() {
+  if (editing) return;
+  editing = true;
+  noteBtn.textContent = '↵ Enter 保存 · Esc 取消';
+  descEl.contentEditable = 'true';
+  descEl.classList.add('editing');
+  const range = document.createRange();
+  range.selectNodeContents(descEl);
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  sel.addRange(range);
+  descEl.focus();
+}
+
+function finishEditNote(cancel) {
+  if (!editing) return;
+  editing = false;
+  if (!cancel) {
+    const text = descEl.textContent.replace(/\s+/g, ' ').trim();
+    if (text) notes[current] = text;   // 保存当前心情的寄语
+    else delete notes[current];        // 清空 = 恢复该心情默认寄语
+    saveStore('notes', notes);         // 持久化:记住寄语
+  }
+  descEl.textContent = notes[current] || MOODS[current].desc;
+  descEl.contentEditable = 'false';
+  descEl.classList.remove('editing');
+  if (cancel) {
+    noteBtn.textContent = '✏️ 编辑寄语';
+  } else {
+    noteBtn.textContent = '✅ 寄语已保存';
+    setTimeout(() => { if (!editing) noteBtn.textContent = '✏️ 编辑寄语'; }, 1600);
+  }
+}
+
+noteBtn.addEventListener('click', startEditNote);
+descEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter')       { e.preventDefault(); finishEditNote(false); }
+  else if (e.key === 'Escape') { e.preventDefault(); finishEditNote(true);  }
+});
+descEl.addEventListener('blur', () => finishEditNote(false));
+
+/* ===================== 重置(先确认,再清空寄语/记录并恢复默认心情) ===================== */
+const resetBtn  = document.getElementById('resetBtn');
+const modalMask = document.getElementById('modalMask');
+
+function openModal()  { modalMask.classList.add('show'); }
+function closeModal() { modalMask.classList.remove('show'); }
+
+function doReset() {
+  closeModal();
+  notes = {};                 // 清空全部自定义寄语
+  saveStore('notes', notes);
+  moodLog.length = 0;         // 清空历史记录
+  saveStore('log', moodLog);
+  renderLog();
+  setMood('happy', true);     // 恢复默认心情(restore 模式:不会写进新的历史记录)
+}
+
+resetBtn.addEventListener('click', openModal);
+document.getElementById('modalCancel').addEventListener('click', closeModal);
+document.getElementById('modalOk').addEventListener('click', doReset);
+// 点弹窗外空白处 = 取消;按 Esc = 取消 —— 都不做任何改动
+modalMask.addEventListener('click', e => { if (e.target === modalMask) closeModal(); });
+window.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
+
+/* ===================== 启动:恢复上次保存的全部状态 ===================== */
+// 1. 恢复主题(深色/浅色)
+const savedTheme = loadStore('theme', 'dark');
+if (savedTheme === 'light') {
+  theme = 'light';
+  document.body.classList.add('theme-light');
+  themeBtn.innerHTML = '<span class="em">🌙</span><span class="lbl">深色</span>';
+}
+
+// 2. 恢复上次选的心情(restore 模式:不写入历史记录、不算一次切换)
+const savedMood = loadStore('current', 'happy');
+setMood(MOODS[savedMood] ? savedMood : 'happy', true);
+
+// 3. 历史记录与寄语已在上方从 localStorage 载入并生效
+tick();
+</script>
+</body>
+</html>
