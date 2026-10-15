@@ -1,0 +1,542 @@
+/* ============================================================
+ * cat_and_mouse.c —— 《猫和老鼠》10 秒追逐动画
+ * 纯 C + Win32 GDI,单文件,无任何第三方依赖
+ *
+ * Visual Studio 2026 使用方法:
+ *   1. 新建项目 -> "空项目"(Empty Project)
+ *   2. 右键"源文件" -> 添加 -> 现有项 -> 选择本文件
+ *   3. 按 F5 运行
+ *
+ * 剧情(共 10 秒):
+ *   0.0-2.6s  片名"猫和老鼠 Tom & Jerry"
+ *   0.0-8.0s  老鼠在前面跑,猫在后面追,距离越来越近
+ *   4.9s      老鼠顺路抓起奶酪举过头顶
+ *   6.0s      猫加速冲刺(身后出现速度线)
+ *   8.0s      老鼠一头钻进墙角老鼠洞
+ *   8.35s     猫撞墙,眼冒金星
+ *   8.9s      老鼠从洞里探头,得意地举着奶酪
+ *   9.0s      显示"剧终! The End!"
+ *
+ * 操作:空格 = 重播,ESC = 退出
+ * ============================================================ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <math.h>
+
+#pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
+/* 即使工程被误建成"控制台应用",也强制按窗口程序链接: */
+#pragma comment(linker, "/SUBSYSTEM:WINDOWS")
+
+#define WIN_W    960
+#define WIN_H    600
+#define GROUND_Y 480               /* 地平线 y */
+#define WALL_X   880               /* 砖墙左边缘 x */
+#define DURATION 10.0              /* 动画总时长(秒) */
+#define T_DIVE   8.0               /* 老鼠钻洞时刻 */
+#define T_CRASH  8.35              /* 猫撞墙时刻 */
+
+static const double PI = 3.14159265358979;
+
+static HFONT      g_fontTitle, g_fontEnd, g_fontSub, g_fontHint;
+static ULONGLONG  g_start;         /* 本轮开始时刻(ms) */
+static BOOL       g_done;          /* 本轮是否播完 */
+
+/* ---------------- 基础绘图小工具 ---------------- */
+static void fillRect(HDC dc, int x, int y, int w, int h, COLORREF c)
+{
+    RECT rc;
+    HBRUSH b = CreateSolidBrush(c);
+    rc.left = x; rc.top = y; rc.right = x + w; rc.bottom = y + h;
+    FillRect(dc, &rc, b);
+    DeleteObject(b);
+}
+
+static void fillEllipse(HDC dc, int cx, int cy, int rx, int ry, COLORREF c)
+{
+    HBRUSH  b  = CreateSolidBrush(c);
+    HGDIOBJ op = SelectObject(dc, GetStockObject(NULL_PEN));
+    HGDIOBJ ob = SelectObject(dc, b);
+    Ellipse(dc, cx - rx, cy - ry, cx + rx, cy + ry);
+    SelectObject(dc, op);
+    SelectObject(dc, ob);
+    DeleteObject(b);
+}
+
+static void drawLine(HDC dc, int x1, int y1, int x2, int y2, int w, COLORREF c)
+{
+    HPEN    p = CreatePen(PS_SOLID, w, c);
+    HGDIOBJ o = SelectObject(dc, p);
+    MoveToEx(dc, x1, y1, NULL);
+    LineTo(dc, x2, y2);
+    SelectObject(dc, o);
+    DeleteObject(p);
+}
+
+static void drawBezier(HDC dc, POINT *pt, int w, COLORREF c)
+{
+    HPEN    p = CreatePen(PS_SOLID, w, c);
+    HGDIOBJ o = SelectObject(dc, p);
+    PolyBezier(dc, pt, 4);
+    SelectObject(dc, o);
+    DeleteObject(p);
+}
+
+static void fillPoly(HDC dc, POINT *pt, int n, COLORREF fill, COLORREF line)
+{
+    HBRUSH  b  = CreateSolidBrush(fill);
+    HPEN    p  = CreatePen(PS_SOLID, 2, line);
+    HGDIOBJ ob = SelectObject(dc, b);
+    HGDIOBJ op = SelectObject(dc, p);
+    Polygon(dc, pt, n);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(b);
+    DeleteObject(p);
+}
+
+static void drawStar(HDC dc, double cx, double cy, double r, COLORREF c)
+{
+    POINT  pt[10];
+    int    i;
+    for (i = 0; i < 10; i++) {
+        double a  = -PI / 2 + i * PI / 5;
+        double rr = (i % 2 == 0) ? r : r * 0.45;
+        pt[i].x = (LONG)(cx + cos(a) * rr);
+        pt[i].y = (LONG)(cy + sin(a) * rr);
+    }
+    fillPoly(dc, pt, 10, c, c);
+}
+
+static HFONT mkfont(int h, int weight)
+{
+    return CreateFontW(h, 0, 0, 0, weight, 0, 0, 0, DEFAULT_CHARSET,
+                       OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Microsoft YaHei");
+}
+
+static void drawText(HDC dc, const wchar_t *s, int x, int y, HFONT f, COLORREF c, UINT align)
+{
+    HGDIOBJ of = SelectObject(dc, f);
+    UINT    oa = SetTextAlign(dc, align);
+    SetTextColor(dc, c);
+    TextOutW(dc, x, y, s, lstrlenW(s));
+    SetTextAlign(dc, oa);
+    SelectObject(dc, of);
+}
+
+/* ---------------- 场景元素 ---------------- */
+static double wrapX(double x, int w)      /* 让云朵循环飘出画面又飘回来 */
+{
+    double range = w + 260.0;
+    x = fmod(x + 130.0, range);
+    if (x < 0) x += range;
+    return x - 130.0;
+}
+
+static void cloud(HDC dc, int cx, int cy, double s)
+{
+    fillEllipse(dc, cx, cy, (int)(34 * s), (int)(16 * s), RGB(250, 252, 255));
+    fillEllipse(dc, cx - (int)(26 * s), cy + 4, (int)(22 * s), (int)(12 * s), RGB(250, 252, 255));
+    fillEllipse(dc, cx + (int)(28 * s), cy + 5, (int)(24 * s), (int)(13 * s), RGB(250, 252, 255));
+}
+
+static void drawCheese(HDC dc, int x, int y, double s)   /* 一块带孔的奶酪楔子 */
+{
+    POINT tri[3];
+    tri[0].x = x - (LONG)(24 * s); tri[0].y = y + (LONG)(12 * s);
+    tri[1].x = x + (LONG)(24 * s); tri[1].y = y + (LONG)(12 * s);
+    tri[2].x = x + (LONG)(6 * s);  tri[2].y = y - (LONG)(14 * s);
+    fillPoly(dc, tri, 3, RGB(255, 199, 72), RGB(204, 144, 30));
+    fillEllipse(dc, x - (int)(8 * s), y + (int)(2 * s), (int)(4 * s), (int)(3 * s), RGB(232, 168, 44));
+    fillEllipse(dc, x + (int)(8 * s), y + (int)(3 * s), (int)(3 * s), (int)(3 * s), RGB(232, 168, 44));
+    fillEllipse(dc, x + (int)(1 * s), y - (int)(5 * s), (int)(3 * s), (int)(2 * s), RGB(232, 168, 44));
+}
+
+/* ---------------- 老鼠 ----------------
+ * px = 脚底中心x, hop = 跳起高度, s = 缩放(钻洞时变小), hasCheese = 是否举着奶酪 */
+static void drawMouse(HDC dc, int px, double t, double hop, double s, int hasCheese)
+{
+    int    fy  = GROUND_Y - (int)hop;
+    double bob = sin(t * 16.0) * 2.5;      /* 跑动时身体上下颠 */
+    double wig = sin(t * 9.0);             /* 尾巴摆动 */
+    int    i;
+
+    {   /* 尾巴 */
+        POINT bp[4];
+        bp[0].x = px - (LONG)(24 * s); bp[0].y = fy + (LONG)(-32 * s);
+        bp[1].x = px - (LONG)(58 * s); bp[1].y = fy + (LONG)((-44 + 10 * wig) * s);
+        bp[2].x = px - (LONG)(84 * s); bp[2].y = fy + (LONG)((-26 + 15 * sin(t * 9.0 + 1.0)) * s);
+        bp[3].x = px - (LONG)(98 * s); bp[3].y = fy + (LONG)((-58 + 18 * sin(t * 7.0)) * s);
+        drawBezier(dc, bp, 4, RGB(232, 160, 140));
+    }
+
+    for (i = 0; i < 2; i++) {              /* 两条小短腿交替倒腾 */
+        double ph   = t * 20.0 + i * PI;
+        double sw   = sin(ph);
+        double lift = cos(ph);
+        int    hipX = px + (int)((i == 0 ? -12.0 : 8.0) * s);
+        int    hipY = fy - (int)(18 * s);
+        int    fx   = hipX + (int)(sw * 12.0 * s);
+        int    fyy  = fy - 2 - (int)((lift > 0 ? lift : 0) * 6.0);
+        drawLine(dc, hipX, hipY, fx, fyy, 4, RGB(160, 104, 66));
+        fillEllipse(dc, fx, fyy, (int)(5 * s) + 2, 3, RGB(160, 104, 66));
+    }
+
+    /* 身体 + 肚皮 */
+    fillEllipse(dc, px - (int)(2 * s), fy + (int)((-42 + bob) * s), (int)(24 * s), (int)(22 * s), RGB(190, 128, 82));
+    fillEllipse(dc, px + (int)(4 * s), fy + (int)((-36 + bob) * s), (int)(14 * s), (int)(12 * s), RGB(222, 178, 130));
+
+    {   /* 头 + 耳朵 + 五官 */
+        int hx = px + (int)(30 * s);
+        int hy = fy + (int)((-64 + bob) * s);
+        fillEllipse(dc, hx - (int)(12 * s), hy - (int)(22 * s), (int)(11 * s), (int)(11 * s), RGB(190, 128, 82));
+        fillEllipse(dc, hx + (int)(12 * s), hy - (int)(22 * s), (int)(11 * s), (int)(11 * s), RGB(190, 128, 82));
+        fillEllipse(dc, hx - (int)(12 * s), hy - (int)(22 * s), (int)(6 * s),  (int)(6 * s),  RGB(246, 178, 168));
+        fillEllipse(dc, hx + (int)(12 * s), hy - (int)(22 * s), (int)(6 * s),  (int)(6 * s),  RGB(246, 178, 168));
+        fillEllipse(dc, hx, hy, (int)(16 * s), (int)(15 * s), RGB(190, 128, 82));
+        fillEllipse(dc, hx - 5, hy - 3, 3, 3, RGB(20, 20, 20));                 /* 眼睛 */
+        fillEllipse(dc, hx + 6, hy - 3, 3, 3, RGB(20, 20, 20));
+        fillEllipse(dc, hx + (int)(15 * s), hy + 2, 3, 3, RGB(240, 120, 140));  /* 鼻子 */
+        drawLine(dc, hx + 12, hy + 4, hx - 10, hy + 2, 1, RGB(120, 80, 50));    /* 胡须 */
+        drawLine(dc, hx + 12, hy + 6, hx - 10, hy + 8, 1, RGB(120, 80, 50));
+        Arc(dc, hx + 2, hy + 2, hx + 16, hy + 12, hx + 16, hy + 8, hx + 2, hy + 8); /* 笑嘴 */
+
+        if (hasCheese) {                    /* 双手把奶酪举过头顶 */
+            drawLine(dc, px + (int)(10 * s), fy + (int)(-38 * s), hx + 2, hy - (int)(14 * s), 3, RGB(190, 128, 82));
+            drawLine(dc, px + (int)(16 * s), fy + (int)(-34 * s), hx + 8, hy - (int)(12 * s), 3, RGB(190, 128, 82));
+            drawCheese(dc, hx, hy - (int)(48 * s), 0.9 * s);
+        }
+    }
+}
+
+/* 结尾:老鼠从洞里得意地探头 */
+static void drawMousePeek(HDC dc, double t)
+{
+    int hx = WALL_X + 34;
+    int hy = GROUND_Y - 22 - (int)(sin(t * 9.0) * 2.0);
+    fillEllipse(dc, hx - 12, hy - 20, 10, 10, RGB(190, 128, 82));
+    fillEllipse(dc, hx + 12, hy - 20, 10, 10, RGB(190, 128, 82));
+    fillEllipse(dc, hx - 12, hy - 20, 5, 5, RGB(246, 178, 168));
+    fillEllipse(dc, hx + 12, hy - 20, 5, 5, RGB(246, 178, 168));
+    fillEllipse(dc, hx, hy, 15, 14, RGB(190, 128, 82));
+    Arc(dc, hx - 9, hy - 6, hx - 1, hy + 2, hx - 9, hy - 2, hx - 1, hy - 2);   /* 眯眯眼 */
+    Arc(dc, hx + 3, hy - 6, hx + 11, hy + 2, hx + 3, hy - 2, hx + 11, hy - 2);
+    fillEllipse(dc, hx - 16, hy + 2, 3, 3, RGB(240, 120, 140));
+    drawLine(dc, hx - 13, hy + 4, hx + 2, hy + 2, 1, RGB(120, 80, 50));
+    drawLine(dc, hx - 6, hy + 12, hx - 10, hy - 26, 3, RGB(190, 128, 82));     /* 举着奶酪庆祝 */
+    drawLine(dc, hx + 8, hy + 12, hx + 10, hy - 24, 3, RGB(190, 128, 82));
+    drawCheese(dc, hx, hy - 46 + (int)(sin(t * 12.0) * 2.0), 1.0);
+}
+
+/* ---------------- 猫 ----------------
+ * cx = 身体中心x, crashed = 是否已撞晕 */
+static void drawCat(HDC dc, int cx, double t, int crashed)
+{
+    double  bob = sin(t * 15.0) * 3.5;
+    double  wag = sin(t * 7.0);
+    int     fy  = GROUND_Y;
+    COLORREF fur  = RGB(108, 118, 138);
+    COLORREF furD = RGB(78, 86, 104);
+    int     i;
+
+    {   /* 大尾巴(甩来甩去) */
+        POINT bp[4];
+        bp[0].x = cx - 48;  bp[0].y = fy - 86 + (LONG)bob;
+        bp[1].x = cx - 92;  bp[1].y = fy - 74 + (LONG)(16 * wag);
+        bp[2].x = cx - 116; bp[2].y = fy - 140 + (LONG)(22 * sin(t * 7.0 + 1.0));
+        bp[3].x = cx - 88;  bp[3].y = fy - 196 + (LONG)(18 * sin(t * 7.0 + 2.0));
+        drawBezier(dc, bp, 9, fur);
+    }
+
+    {   /* 四条腿(前后两组交替) */
+        static const double hipOff[4] = { -34, -18, 20, 34 };
+        for (i = 0; i < 4; i++) {
+            double ph   = t * 17.0 + (i < 2 ? 0.0 : PI) + i * 0.45;
+            double lift = cos(ph);
+            int    hipX = cx + (int)hipOff[i];
+            int    fx   = hipX + (int)(sin(ph) * 16.0);
+            int    fyy  = fy - 2 - (int)((lift > 0 ? lift : 0) * 9.0);
+            drawLine(dc, hipX, fy - 44, fx, fyy, 8, furD);
+            fillEllipse(dc, fx + 3, fyy, 8, 4, furD);
+        }
+    }
+
+    /* 身体 + 肚皮 */
+    fillEllipse(dc, cx - 2, fy - 74 + (int)bob, 54, 42, fur);
+    fillEllipse(dc, cx + 8, fy - 58 + (int)bob, 30, 24, RGB(168, 178, 198));
+
+    {   /* 头 + 耳朵 + 五官 */
+        int hx = cx + 74, hy = fy - 116 + (int)bob;
+        POINT earL[3]  = { { hx - 30, hy - 16 }, { hx - 40, hy - 52 }, { hx - 6,  hy - 30 } };
+        POINT earR[3]  = { { hx + 8,  hy - 30 }, { hx + 40, hy - 52 }, { hx + 30, hy - 16 } };
+        POINT earLi[3] = { { hx - 28, hy - 22 }, { hx - 34, hy - 46 }, { hx - 12, hy - 30 } };
+        POINT earRi[3] = { { hx + 12, hy - 30 }, { hx + 34, hy - 46 }, { hx + 28, hy - 22 } };
+        fillPoly(dc, earL, 3, fur, furD);
+        fillPoly(dc, earR, 3, fur, furD);
+        fillPoly(dc, earLi, 3, RGB(244, 170, 170), furD);
+        fillPoly(dc, earRi, 3, RGB(244, 170, 170), furD);
+        fillEllipse(dc, hx, hy, 32, 30, fur);
+        fillEllipse(dc, hx + 12, hy + 10, 20, 13, RGB(232, 236, 242));          /* 吻部 */
+
+        if (!crashed) {                                                        /* 圆瞪眼盯着老鼠 */
+            fillEllipse(dc, hx - 8, hy - 8, 7, 8, RGB(255, 255, 255));
+            fillEllipse(dc, hx + 14, hy - 8, 7, 8, RGB(255, 255, 255));
+            fillEllipse(dc, hx - 6, hy - 7, 3, 4, RGB(20, 20, 20));
+            fillEllipse(dc, hx + 16, hy - 7, 3, 4, RGB(20, 20, 20));
+        } else {                                                               /* 撞晕:XX 眼 + 吐舌头 */
+            drawLine(dc, hx - 13, hy - 13, hx - 3, hy - 3, 3, RGB(40, 40, 40));
+            drawLine(dc, hx - 3,  hy - 13, hx - 13, hy - 3, 3, RGB(40, 40, 40));
+            drawLine(dc, hx + 9,  hy - 13, hx + 19, hy - 3, 3, RGB(40, 40, 40));
+            drawLine(dc, hx + 19, hy - 13, hx + 9,  hy - 3, 3, RGB(40, 40, 40));
+            fillEllipse(dc, hx + 22, hy + 24, 6, 9, RGB(235, 120, 130));
+        }
+
+        {   /* 鼻子 + 咧嘴笑 + 胡须 */
+            POINT nose[3] = { { hx + 26, hy + 6 }, { hx + 36, hy + 10 }, { hx + 26, hy + 14 } };
+            fillPoly(dc, nose, 3, RGB(230, 120, 150), RGB(180, 80, 110));
+        }
+        Arc(dc, hx + 10, hy + 8, hx + 38, hy + 32, hx + 38, hy + 26, hx + 12, hy + 28);
+        for (i = -1; i <= 1; i++) {
+            drawLine(dc, hx - 20, hy + 8 + i * 5,  hx - 48, hy + 2 + i * 10, 1, furD);
+            drawLine(dc, hx + 30, hy + 10 + i * 4, hx + 58, hy + 4 + i * 10, 1, furD);
+        }
+
+        if (t >= T_DIVE && t < T_CRASH)        /* 扑过去的瞬间张大嘴 */
+            fillEllipse(dc, hx + 20, hy + 16, 10, 8, RGB(200, 70, 80));
+    }
+}
+
+/* ---------------- 每一帧的完整画面 ---------------- */
+static void render(HDC dc, int w, int h, double t)
+{
+    int    i;
+    double catX;
+
+    /* 天空 / 太阳 / 云 */
+    fillRect(dc, 0, 0, w, h, RGB(137, 208, 250));
+    fillEllipse(dc, 95, 88, 40, 40, RGB(255, 220, 90));
+    for (i = 0; i < 8; i++) {
+        double a = t * 0.5 + i * PI / 4.0;
+        drawLine(dc, (int)(95 + cos(a) * 48), (int)(88 + sin(a) * 48),
+                    (int)(95 + cos(a) * 62), (int)(88 + sin(a) * 62), 3, RGB(255, 200, 60));
+    }
+    cloud(dc, (int)wrapX(150 - t * 14, w), 80, 1.0);
+    cloud(dc, (int)wrapX(480 - t * 22, w), 130, 0.8);
+    cloud(dc, (int)wrapX(760 - t * 10, w), 60, 1.2);
+
+    /* 地面 / 草丛 */
+    fillRect(dc, 0, GROUND_Y, w, h - GROUND_Y, RGB(96, 186, 96));
+    for (i = 0; i < 12; i++) {
+        int gx = 30 + i * 78;
+        POINT g[3];
+        if (gx > WALL_X - 30) break;
+        g[0].x = gx;      g[0].y = GROUND_Y + 2;
+        g[1].x = gx + 7;  g[1].y = GROUND_Y - 14;
+        g[2].x = gx + 14; g[2].y = GROUND_Y + 2;
+        fillPoly(dc, g, 3, RGB(64, 160, 72), RGB(64, 160, 72));
+    }
+
+    /* 砖墙 + 老鼠洞 */
+    fillRect(dc, WALL_X, 200, w - WALL_X, h - 200, RGB(150, 99, 70));
+    for (i = 200; i < h; i += 44) {
+        int bx;
+        drawLine(dc, WALL_X, i, w, i, 2, RGB(110, 70, 48));
+        for (bx = ((i / 44) % 2) ? WALL_X : WALL_X + 30; bx < w; bx += 60)
+            drawLine(dc, bx, i, bx, i + 44, 2, RGB(110, 70, 48));
+    }
+    fillEllipse(dc, WALL_X + 45, GROUND_Y + 6, 33, 44, RGB(38, 30, 28));
+
+    /* 路边的奶酪(4.9 秒被老鼠拿走) */
+    if (t < 4.9)
+        drawCheese(dc, 560, GROUND_Y - 12, 1.0);
+
+    /* ---- 老鼠 ---- */
+    if (t < T_DIVE + 0.25) {
+        double mx  = 60 + 102 * t;
+        double s   = 1.0;
+        double hop = 6 * fabs(sin(t * 5.0));          /* 一路小碎步蹦跶 */
+        if (t > T_DIVE) {                              /* 钻洞:往洞里缩 */
+            double k = (t - T_DIVE) / 0.25;
+            mx = 876 + k * 50;
+            s  = 1.0 - 0.75 * k;
+        }
+        if (t >= 4.85 && t <= 5.25)                    /* 抓奶酪时跳一下 */
+            hop += 34 * sin((t - 4.85) * PI / 0.4);
+        if (t < T_DIVE)
+            fillEllipse(dc, (int)mx, GROUND_Y + 4, 26, 5, RGB(70, 150, 80));  /* 影子 */
+        drawMouse(dc, (int)mx, t, hop, s, t >= 4.9);
+    } else if (t >= 8.9) {
+        drawMousePeek(dc, t);
+    }
+
+    /* ---- 猫:一路追近,最后扑向墙洞 ---- */
+    if (t < T_DIVE)
+        catX = (60 + 102 * t) - (280 - 17.5 * t);      /* 追赶:距离 280 -> 140 */
+    else if (t < T_CRASH)
+        catX = 736 + (t - T_DIVE) / (T_CRASH - T_DIVE) * 41;   /* 猛扑 */
+    else {
+        double k = (t - T_CRASH) / 0.2;                 /* 撞墙后弹回一点 */
+        if (k > 1) k = 1;
+        catX = 777 - 14 * k;
+    }
+    if (t < T_DIVE)
+        fillEllipse(dc, (int)catX + 6, GROUND_Y + 4, 58, 7, RGB(70, 150, 80)); /* 影子 */
+    if (t > 6.0 && t < T_DIVE) {                        /* 冲刺速度线 */
+        for (i = 0; i < 3; i++)
+            drawLine(dc, (int)catX - 115, 380 + i * 22, (int)catX - 180, 380 + i * 22, 3, RGB(255, 255, 255));
+    }
+    drawCat(dc, (int)catX, t, t >= T_CRASH);
+
+    /* 撞墙特效:爆炸大星星 + 扬起的灰尘 */
+    if (t >= T_CRASH && t < T_CRASH + 0.5) {
+        double k = (t - T_CRASH) / 0.5;
+        drawStar(dc, WALL_X - 4, 350, 26 + 70 * k, RGB(255, 224, 96));
+        for (i = 0; i < 3; i++)
+            fillEllipse(dc, WALL_X - 30 - i * 16, GROUND_Y - 6 - i * 22,
+                        (int)(7 + 22 * k), (int)(6 + 18 * k), RGB(205, 205, 205));
+    }
+    /* 头顶转圈的小星星 */
+    if (t >= T_CRASH + 0.25) {
+        for (i = 0; i < 3; i++) {
+            double a = t * 5.0 + i * 2.0944;
+            drawStar(dc, catX + 74 + cos(a) * 55, 312 + sin(a) * 13, 9, RGB(255, 214, 64));
+        }
+    }
+
+    /* ---- 文字 ---- */
+    SetBkMode(dc, TRANSPARENT);
+    if (t < 2.6) {
+        drawText(dc, L"猫和老鼠", w / 2 + 2, 132, g_fontTitle, RGB(90, 60, 20), TA_CENTER);
+        drawText(dc, L"猫和老鼠", w / 2,     130, g_fontTitle, RGB(255, 244, 150), TA_CENTER);
+        drawText(dc, L"Tom & Jerry · 10 秒追逐动画", w / 2, 210, g_fontSub, RGB(255, 255, 255), TA_CENTER);
+    }
+    if (t >= 9.0) {
+        drawText(dc, L"剧终!The End!", w / 2 + 2, 222, g_fontEnd, RGB(120, 60, 10), TA_CENTER);
+        drawText(dc, L"剧终!The End!", w / 2,     220, g_fontEnd, RGB(255, 224, 96), TA_CENTER);
+        drawText(dc, L"按 空格键 重播 · ESC 退出", w / 2, 300, g_fontHint, RGB(255, 255, 255), TA_CENTER);
+    }
+    drawText(dc, L"空格 重播 / ESC 退出", w - 12, 12, g_fontHint, RGB(255, 255, 255), TA_RIGHT);
+
+    /* 底部进度条(直观看到 10 秒) */
+    fillRect(dc, 0, h - 8, w, 8, RGB(84, 140, 90));
+    fillRect(dc, 0, h - 8, (int)(w * t / DURATION), 8, RGB(120, 230, 110));
+}
+
+/* ---------------- 窗口过程 ---------------- */
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        g_fontTitle = mkfont(60, FW_BOLD);
+        g_fontEnd   = mkfont(52, FW_BOLD);
+        g_fontSub   = mkfont(26, FW_NORMAL);
+        g_fontHint  = mkfont(20, FW_NORMAL);
+        g_start = GetTickCount64();
+        SetTimer(hwnd, 1, 15, NULL);              /* 约 60 帧/秒 */
+        return 0;
+
+    case WM_TIMER:
+        if (!g_done && GetTickCount64() - g_start >= (ULONGLONG)(DURATION * 1000)) {
+            g_done = TRUE;
+            KillTimer(hwnd, 1);                   /* 播完停在结尾画面 */
+        }
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+
+    case WM_ERASEBKGND:
+        return 1;                                 /* 不擦背景,防闪烁 */
+
+    case WM_PAINT: {                              /* 双缓冲绘图 */
+        PAINTSTRUCT ps;
+        HDC     dc;
+        RECT    rc;
+        int     w, hh;
+        HDC     mem;
+        HBITMAP bm;
+        HGDIOBJ old;
+        double  t;
+        dc = BeginPaint(hwnd, &ps);
+        GetClientRect(hwnd, &rc);
+        w = rc.right; hh = rc.bottom;
+        mem  = CreateCompatibleDC(dc);
+        bm   = CreateCompatibleBitmap(dc, w, hh);
+        old  = SelectObject(mem, bm);
+        t    = (double)(GetTickCount64() - g_start) / 1000.0;
+        if (t > DURATION) t = DURATION;
+        render(mem, w, hh, t);
+        BitBlt(dc, 0, 0, w, hh, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteObject(bm);
+        DeleteDC(mem);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_KEYDOWN:
+        if (wp == VK_ESCAPE) { DestroyWindow(hwnd); return 0; }
+        if (wp == VK_SPACE) {                     /* 重播 */
+            g_start = GetTickCount64();
+            if (g_done) { g_done = FALSE; SetTimer(hwnd, 1, 15, NULL); }
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(hwnd, 1);
+        DeleteObject(g_fontTitle);
+        DeleteObject(g_fontEnd);
+        DeleteObject(g_fontSub);
+        DeleteObject(g_fontHint);
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ---------------- 程序入口 ---------------- */
+int APIENTRY WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int nShow)
+{
+    WNDCLASSW wc;
+    RECT      rc;
+    DWORD     style;
+    int       ww, wh;
+    HWND      hwnd;
+    MSG       msg;
+
+    (void)hPrev; (void)cmd;
+
+    wc.style         = 0;
+    wc.lpfnWndProc   = WndProc;
+    wc.cbClsExtra    = 0;
+    wc.cbWndExtra    = 0;
+    wc.hInstance     = hInst;
+    wc.hIcon         = LoadIconW(NULL, (LPCWSTR)IDI_APPLICATION);
+    wc.hCursor       = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
+    wc.lpszMenuName  = NULL;
+    wc.lpszClassName = L"CatMouseAnim";
+    if (!RegisterClassW(&wc)) return 1;
+
+    rc.left = 0; rc.top = 0; rc.right = WIN_W; rc.bottom = WIN_H;
+    style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;  /* 固定大小 */
+    AdjustWindowRect(&rc, style, FALSE);
+    ww = rc.right - rc.left;
+    wh = rc.bottom - rc.top;
+
+    hwnd = CreateWindowW(L"CatMouseAnim", L"猫和老鼠 · Tom & Jerry (C 语言动画)",
+                         style,
+                         (GetSystemMetrics(SM_CXSCREEN) - ww) / 2,
+                         (GetSystemMetrics(SM_CYSCREEN) - wh) / 2,
+                         ww, wh, NULL, NULL, hInst, NULL);
+    if (!hwnd) return 1;
+
+    ShowWindow(hwnd, nShow);
+    UpdateWindow(hwnd);
+
+    while (GetMessageW(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    return (int)msg.wParam;
+}
